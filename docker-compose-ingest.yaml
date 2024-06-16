@@ -1,0 +1,12 @@
+services:
+  ingest-producer:
+    network_mode: host
+    build: 
+      context: ./backend
+      target: tester-producer
+    entrypoint: ['python','-u','/ingest/main.py']
+    volumes:
+      - ./backend/ingest:/ingest
+    restart: on-failure
+    environment:
+      - PRODUCER_ADDR=0.0.0.0:8000

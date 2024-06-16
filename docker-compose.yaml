@@ -1,0 +1,313 @@
+services:
+  # test-producer:
+  #   build: 
+  #     context: ./backend
+  #     target: tester-producer
+  #   entrypoint: ['python','-u','/test/main.py']
+  #   volumes:
+  #     - ./backend/test:/test
+  #   env_file: env/dev.env
+  #   restart: on-failure
+  #   depends_on:
+  #     - producer
+  producer:
+    build: &producer-build 
+      context: ./backend
+      target: producer
+    ports:
+      - 8000:8000
+    volumes:
+      - ./backend/producer/main.py:/main.py
+    entrypoint: ['python','-u','-m','gunicorn', '--bind', '0.0.0.0:8000', 'main:app']
+    depends_on:
+      - redpanda
+      - kafka-admin
+    restart: always
+    env_file: env/dev.env
+  elastic-connector:
+    build:
+      context: ./backend
+      target: elastic-connector
+    volumes:
+      - ./backend/elastic-connector/main.py:/main.py
+    entrypoint: ['python','-u','/main.py']
+    depends_on:
+      - redpanda
+      - elastic
+    restart: always
+    env_file: env/dev.env
+  processed-elastic-connector:
+    build:
+      context: ./backend
+      target: elastic-connector
+    volumes:
+      - ./backend/processed-elastic-connector/main.py:/main.py
+    entrypoint: ['python','-u','/main.py']
+    depends_on:
+      - redpanda
+      - elastic
+    restart: always
+    env_file: env/dev.env
+  # model-trainer:
+  #   build: 
+  #     context: ./backend
+  #     target: model-trainer
+  #   volumes:
+  #     - ./backend/model_trainer/main.py:/main.py
+  #     - ./model:/model
+  #   entrypoint: ['python','-u','/main.py']
+  #   depends_on:
+  #     - redpanda
+  #   restart: always
+  #   env_file: env/dev.env
+  kafka-admin:
+    build: *producer-build
+    volumes:
+      - ./backend/admin/main.py:/main.py
+    entrypoint: ['python','/main.py']
+    env_file: env/dev.env
+    depends_on:
+      - redpanda
+    restart: on-failure
+  redpanda:
+    image: docker.redpanda.com/vectorized/redpanda:v22.2.2
+    command:
+      - redpanda start
+      - --smp 1
+      - --overprovisioned
+      - --node-id 0
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:19092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:9092,OUTSIDE://0.0.0.0:19092
+      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr internal://redpanda:8082,external://0.0.0.0:18082
+      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr redpanda:33145
+      - --advertise-rpc-addr redpanda:33145
+      - --mode dev-container
+      - --default-log-level=debug
+    ports:
+      - 18081:18081
+      - 18082:18082
+      - 19092:19092
+      - 19644:9644
+  console:
+    container_name: redpanda-console
+    image: docker.redpanda.com/redpandadata/console:v2.3.8
+    entrypoint: /bin/sh
+    command: -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml; /app/console'
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["redpanda:9092"]
+          schemaRegistry:
+            enabled: true
+            urls: ["http://redpanda:8081"]
+        redpanda:
+          adminApi:
+            enabled: true
+            urls: ["http://redpanda:9644"]
+    ports:
+      - 18083:8080
+    depends_on:
+      - redpanda
+  spark-connector:
+    build: 
+      context: ./backend
+      target: spark-sbert2
+    ports:
+      - "4040:4040"
+    volumes:
+      - ./backend/spark-connector/main.py:/main.py
+      - ./model:/model
+    entrypoint: bash -c "$${SPARK_HOME}/bin/spark-submit \
+      --deploy-mode client \
+      --jars local:///opt/spark/jars/spark-sql-kafka.jar,local:///opt/spark/jars/kafka-clients.jar,local:///opt/spark/jars/commons-pool.jar,local:///opt/spark/jars/spark-streaming-kafka.jar,local:///opt/spark/jars/spark-token-provider.jar\
+      /main.py"
+    depends_on:
+      - redpanda
+    env_file: env/dev.env
+    restart: always
+  spark-master:
+    build:
+      context: ./backend
+      target: spark-sbert2
+    ports:
+      - "28080:8080"
+      - "7077:7077"
+    environment:
+      - SPARK_LOCAL_IP=spark-master
+      - SPARK_WORKLOAD=master
+    command: bash -c "$${SPARK_HOME}/bin/spark-class org.apache.spark.deploy.master.Master"
+    restart: always
+    env_file: env/dev.env
+  spark-worker-1:
+    build:
+      context: ./backend
+      target: spark-sbert2
+    ports:
+      - "28081:8081"
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MASTER=spark://spark-master:7077
+      - SPARK_WORKER_CORES=1
+      - SPARK_WORKER_MEMORY=1G
+      - SPARK_DRIVER_MEMORY=1G
+      - SPARK_EXECUTOR_MEMORY=1G
+      - SPARK_WORKLOAD=worker
+      - SPARK_LOCAL_IP=spark-worker-1
+    command: bash -c "$${SPARK_HOME}/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077"
+  spark-worker-2:
+    build:
+      context: ./backend
+      target: spark-sbert2
+    ports:
+      - "28082:8081"
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MASTER=spark://spark-master:7077
+      - SPARK_WORKER_CORES=1
+      - SPARK_WORKER_MEMORY=1G
+      - SPARK_DRIVER_MEMORY=1G
+      - SPARK_EXECUTOR_MEMORY=1G
+      - SPARK_WORKLOAD=worker
+      - SPARK_LOCAL_IP=spark-worker-2
+
+    command: bash -c "$${SPARK_HOME}/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077"
+  # spark-worker-3:
+  #   build:
+  #     context: ./backend
+  #     target: spark-sbert2
+  #   ports:
+  #     - "28083:8081"
+  #   depends_on:
+  #     - spark-master
+  #   environment:
+  #     - SPARK_MASTER=spark://spark-master:7077
+  #     - SPARK_WORKER_CORES=1
+  #     - SPARK_WORKER_MEMORY=1G
+  #     - SPARK_DRIVER_MEMORY=1G
+  #     - SPARK_EXECUTOR_MEMORY=1G
+  #     - SPARK_WORKLOAD=worker
+  #     - SPARK_LOCAL_IP=spark-worker-3
+
+  #   command: bash -c "$${SPARK_HOME}/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077"
+  namenode:
+    image: apache/hadoop:3
+    hostname: namenode
+    command: ["hdfs", "namenode"]
+    ports:
+      - 9870:9870
+    env_file:
+      - ./env/hadoop.env
+    environment:
+        ENSURE_NAMENODE_DIR: "/tmp/hadoop-root/dfs/name"
+    restart: always
+  datanode-1:
+    image: apache/hadoop:3
+    command: ["hdfs", "datanode"]
+    env_file:
+      - ./env/hadoop.env    
+    restart: always
+  datanode-2:
+    image: apache/hadoop:3
+    command: ["hdfs", "datanode"]
+    env_file:
+      - ./env/hadoop.env   
+    restart: always
+  datanode-3:
+    image: apache/hadoop:3
+    command: ["hdfs", "datanode"]
+    env_file:
+      - ./env/hadoop.env     
+    restart: always
+
+  resourcemanager:
+    image: apache/hadoop:3
+    hostname: resourcemanager
+    command: ["yarn", "resourcemanager"]
+    ports:
+        - 8088:8088
+    env_file:
+      - ./env/hadoop.env
+    volumes:
+      - ./test.sh:/opt/test.sh
+    restart: always
+
+  nodemanager:
+    image: apache/hadoop:3
+    command: ["yarn", "nodemanager"]
+    env_file:
+      - ./env/hadoop.env
+    restart: always
+
+  # connect:
+  #   image: confluentinc/cp-kafka-connect-base:latest
+  #   build:
+  #     context: ./connector
+  #     target: elastic
+  #   depends_on:
+  #     - redpanda
+  #     - elastic
+  #   ports:
+  #     - "8083:8083"
+  #   environment:
+  #     CONNECT_BOOTSTRAP_SERVERS: 'redpanda:9092'
+  #     CONNECT_REST_ADVERTISED_HOST_NAME: connect
+  #     CONNECT_REST_PORT: 8083
+  #     CONNECT_GROUP_ID: connect-cluster-group
+  #     CONNECT_CONFIG_STORAGE_TOPIC: docker-connect-configs
+  #     CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+  #     CONNECT_OFFSET_FLUSH_INTERVAL_MS: 10000
+  #     CONNECT_OFFSET_STORAGE_TOPIC: docker-connect-offsets
+  #     CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+  #     CONNECT_STATUS_STORAGE_TOPIC: docker-connect-status
+  #     CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+  #     CONNECT_PLUGIN_PATH: "/usr/share/java,/usr/share/confluent-hub-components"
+  #     CONNECT_AUTO_CREATE_TOPICS_ENABLE: "true"
+  #     CONNECT_KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+  #     CONNECT_VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+  elastic:
+    image: elasticsearch:8.13.4
+    ports:
+      - 9200:9200
+    environment: 
+    - 'ES_JAVA_OPTS=-Xms2g -Xmx2g'
+    - 'bootstrap.memory_lock=true'
+    - 'discovery.type=single-node'
+    - 'xpack.security.enabled=false'
+    - 'xpack.security.enrollment.enabled=false'
+    # - ELASTICSEARCH_PASSWORD=elastic
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+  kibana:
+    depends_on:
+      - elastic
+    image: kibana:8.13.4
+    ports:
+      - 5601:5601
+    environment:
+      # - SERVERNAME=kibana
+      - ELASTICSEARCH_HOSTS=http://elastic:9200
+      # - ELASTICSEARCH_USERNAME=elastic
+      # - ELASTICSEARCH_PASSWORD=elastic
+  # demo-database:
+  #   image: postgres:11.7-alpine
+  #   ports: 
+  #     - "5432:5432"
+  #   environment: 
+  #     - POSTGRES_PASSWORD=casa1234
+  # consumer:
+  # model:
+  # hook:
+  # deploy:
+  # fluentd:
+  # elastic:
+  # postgres:
